@@ -30,9 +30,17 @@ enum class MusicPlaybackState : uint8_t {
     Paused,
 };
 
+enum class MusicPlayerView : uint8_t {
+    Player,
+    Settings,
+};
+
 struct MusicPlayerContext {
     AppInstanceId appInstanceId = 0;
     WindowId window = 0;
+    lv_obj_t* root = nullptr;
+    MusicPlayerView view = MusicPlayerView::Player;
+    lv_timer_t* viewTimer = nullptr;
 
     std::mutex tracksMutex;
     std::vector<MusicTrack> tracks;

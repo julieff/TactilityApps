@@ -30,6 +30,16 @@ void onClosePressed(lv_event_t* event) {
     app_event_emit_close(context->appInstanceId);
 }
 
+void showView(MusicPlayerContext* context, MusicPlayerView view);
+
+void onSettingsPressed(lv_event_t* event) {
+    showView(static_cast<MusicPlayerContext*>(lv_event_get_user_data(event)), MusicPlayerView::Settings);
+}
+
+void onBackPressed(lv_event_t* event) {
+    showView(static_cast<MusicPlayerContext*>(lv_event_get_user_data(event)), MusicPlayerView::Player);
+}
+
 void setStatus(MusicPlayerContext* context, const std::string& status) {
     std::lock_guard lock(context->statusMutex);
     context->statusText = status;
@@ -335,13 +345,23 @@ void setButtonText(lv_obj_t* button, const char* text) {
     lv_obj_center(label);
 }
 
-void createWidgetsImpl(lv_obj_t* parent, MusicPlayerContext* context) {
-    const lv_coord_t padding = lvgl_get_ui_density() == LVGL_UI_DENSITY_COMPACT ? 6 : 10;
+void onViewTimer(lv_timer_t* timer) {
+    auto* context = static_cast<MusicPlayerContext*>(lv_timer_get_user_data(timer));
+    context->viewTimer = nullptr;
+    musicPlayerCreateWidgets(context->root, context);
+}
 
-    lv_obj_set_flex_flow(parent, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_scrollable(parent, false);
-    auto* toolbar = lvgl_toolbar_create(parent, "Music Player");
-    lvgl_toolbar_set_nav_action(toolbar, LV_SYMBOL_CLOSE, onClosePressed, context);
+void showView(MusicPlayerContext* context, MusicPlayerView view) {
+    context->view = view;
+    if (context->viewTimer == nullptr) {
+        context->viewTimer = lv_timer_create(onViewTimer, 0, context);
+        lv_timer_set_repeat_count(context->viewTimer, 1);
+    }
+}
+
+void createSettingsWidgets(lv_obj_t* parent, MusicPlayerContext* context, lv_coord_t padding) {
+    auto* toolbar = lvgl_toolbar_create(parent, "Music Player Settings");
+    lvgl_toolbar_set_nav_action(toolbar, LV_SYMBOL_LEFT, onBackPressed, context);
 
     auto* content = lv_obj_create(parent);
     lv_obj_set_width(content, LV_PCT(100));
@@ -401,6 +421,34 @@ void createWidgetsImpl(lv_obj_t* parent, MusicPlayerContext* context) {
     context->volumeLabel = lv_label_create(volumeRow);
     lv_obj_set_width(context->volumeLabel, LV_SIZE_CONTENT);
     lv_label_set_text_fmt(context->volumeLabel, "%u%%", context->volumePercent);
+    setVolumeSliderFromDevice(context);
+}
+
+void createWidgetsImpl(lv_obj_t* parent, MusicPlayerContext* context) {
+    const lv_coord_t padding = lvgl_get_ui_density() == LVGL_UI_DENSITY_COMPACT ? 6 : 10;
+
+    lv_obj_set_flex_flow(parent, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_scrollable(parent, false);
+    lv_obj_clean(parent);
+
+    if (context->view == MusicPlayerView::Settings) {
+        createSettingsWidgets(parent, context, padding);
+        return;
+    }
+
+    auto* toolbar = lvgl_toolbar_create(parent, "Music Player");
+    lvgl_toolbar_set_nav_action(toolbar, LV_SYMBOL_CLOSE, onClosePressed, context);
+    lvgl_toolbar_add_text_button_action(toolbar, LV_SYMBOL_SETTINGS, onSettingsPressed, context);
+
+    auto* content = lv_obj_create(parent);
+    lv_obj_set_width(content, LV_PCT(100));
+    lv_obj_set_flex_grow(content, 1);
+    lv_obj_set_flex_flow(content, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_all(content, padding, LV_STATE_DEFAULT);
+    lv_obj_set_style_pad_gap(content, padding, LV_STATE_DEFAULT);
+    lv_obj_set_style_border_width(content, 0, LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_opa(content, LV_OPA_TRANSP, LV_STATE_DEFAULT);
+    lv_obj_set_scroll_dir(content, LV_DIR_VER);
 
     auto* playerCard = createCard(content);
     context->trackTitleLabel = lv_label_create(playerCard);
@@ -552,6 +600,7 @@ void clearWidgetPointers(MusicPlayerContext* context) {
 
 void musicPlayerCreateWidgets(lv_obj_t* parent, void* userData) {
     auto* context = static_cast<MusicPlayerContext*>(userData);
+    context->root = parent;
     if (context->refreshTimer != nullptr) {
         lv_timer_delete(context->refreshTimer);
         context->refreshTimer = nullptr;
@@ -568,6 +617,10 @@ void musicPlayerDestroyWidgets(void* userData) {
     if (context->refreshTimer != nullptr) {
         lv_timer_delete(context->refreshTimer);
         context->refreshTimer = nullptr;
+    }
+    if (context->viewTimer != nullptr) {
+        lv_timer_delete(context->viewTimer);
+        context->viewTimer = nullptr;
     }
     clearWidgetPointers(context);
 }

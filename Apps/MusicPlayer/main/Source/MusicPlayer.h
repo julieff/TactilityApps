@@ -31,19 +31,31 @@ enum class MusicPlaybackState : uint8_t {
 };
 
 enum class MusicPlayerView : uint8_t {
+    Library,
     Player,
     Settings,
+};
+
+struct MusicBrowserEntry {
+    std::string name;
+    std::string path;
+    bool isDirectory = false;
 };
 
 struct MusicPlayerContext {
     AppInstanceId appInstanceId = 0;
     WindowId window = 0;
     lv_obj_t* root = nullptr;
-    MusicPlayerView view = MusicPlayerView::Player;
+    MusicPlayerView view = MusicPlayerView::Library;
+    MusicPlayerView returnView = MusicPlayerView::Library;
     lv_timer_t* viewTimer = nullptr;
+    lv_timer_t* folderTimer = nullptr;
+    std::string pendingFolderPath;
 
     std::mutex tracksMutex;
     std::vector<MusicTrack> tracks;
+    std::vector<MusicTrack> playbackQueue;
+    std::vector<MusicBrowserEntry> browserEntries;
     int32_t selectedTrackIndex = -1;
 
     std::mutex outputMutex;
@@ -65,11 +77,16 @@ struct MusicPlayerContext {
     std::mutex statusMutex;
     std::string statusText = "Ready";
 
-    std::string folderPath = "/sdcard/Music";
+    std::string folderPath = "/sdcard";
     uint8_t volumePercent = 80;
     bool updatingVolumeSlider = false;
 
     lv_obj_t* folderInput = nullptr;
+    lv_obj_t* browserPathLabel = nullptr;
+    lv_obj_t* browserList = nullptr;
+    lv_obj_t* miniTitleLabel = nullptr;
+    lv_obj_t* miniArtistLabel = nullptr;
+    lv_obj_t* miniPlayButtonLabel = nullptr;
     lv_obj_t* outputDropdown = nullptr;
     lv_obj_t* volumeSlider = nullptr;
     lv_obj_t* volumeLabel = nullptr;
@@ -80,8 +97,6 @@ struct MusicPlayerContext {
     lv_obj_t* progressBar = nullptr;
     lv_obj_t* progressLabel = nullptr;
     lv_obj_t* playButtonLabel = nullptr;
-    lv_obj_t* trackList = nullptr;
-    lv_obj_t* trackCountLabel = nullptr;
     lv_timer_t* refreshTimer = nullptr;
 };
 
@@ -91,4 +106,5 @@ void musicPlayerTaskEntry(void* param);
 bool musicPlayerStartTask(MusicPlayerContext* context);
 void musicPlayerScanFolder(MusicPlayerContext* context, const std::string& path);
 void musicPlayerRequestStart(MusicPlayerContext* context, int32_t trackIndex);
+void musicPlayerRequestQueueStart(MusicPlayerContext* context, int32_t trackIndex);
 void musicPlayerRequestStop(MusicPlayerContext* context);

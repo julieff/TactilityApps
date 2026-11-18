@@ -31,13 +31,29 @@ void onClosePressed(lv_event_t* event) {
 }
 
 void showView(MusicPlayerContext* context, MusicPlayerView view);
+void renderTrackList(MusicPlayerContext* context);
+void updateTrackInfo(MusicPlayerContext* context);
+void scheduleFolderScan(MusicPlayerContext* context, const std::string& path);
 
 void onSettingsPressed(lv_event_t* event) {
-    showView(static_cast<MusicPlayerContext*>(lv_event_get_user_data(event)), MusicPlayerView::Settings);
+    auto* context = static_cast<MusicPlayerContext*>(lv_event_get_user_data(event));
+    context->returnView = context->view;
+    showView(context, MusicPlayerView::Settings);
 }
 
 void onBackPressed(lv_event_t* event) {
-    showView(static_cast<MusicPlayerContext*>(lv_event_get_user_data(event)), MusicPlayerView::Player);
+    auto* context = static_cast<MusicPlayerContext*>(lv_event_get_user_data(event));
+    showView(context, context->view == MusicPlayerView::Settings ? context->returnView : MusicPlayerView::Library);
+}
+
+void onParentFolderPressed(lv_event_t* event) {
+    auto* context = static_cast<MusicPlayerContext*>(lv_event_get_user_data(event));
+    if (context->folderPath == "/sdcard") {
+        return;
+    }
+    const size_t separator = context->folderPath.find_last_of('/');
+    const std::string parent = separator <= 7 ? "/sdcard" : context->folderPath.substr(0, separator);
+    scheduleFolderScan(context, parent);
 }
 
 void setStatus(MusicPlayerContext* context, const std::string& status) {
@@ -174,93 +190,139 @@ size_t getTrackCount(MusicPlayerContext* context) {
     return context->tracks.size();
 }
 
+size_t getPlaybackQueueCount(MusicPlayerContext* context) {
+    std::lock_guard lock(context->tracksMutex);
+    return context->playbackQueue.size();
+}
+
 void formatTime(uint32_t seconds, char* output, size_t outputSize) {
     snprintf(output, outputSize, "%u:%02u", static_cast<unsigned>(seconds / 60),
              static_cast<unsigned>(seconds % 60));
 }
 
 void updateTrackInfo(MusicPlayerContext* context) {
-    if (context->trackTitleLabel == nullptr) {
+    if (context->trackTitleLabel == nullptr && context->miniTitleLabel == nullptr) {
         return;
     }
     MusicTrack track;
-    const int32_t index = getSelectedTrackIndex(context);
-    if (!copyTrack(context, index, &track)) {
-        lv_label_set_text(context->trackTitleLabel, "No track selected");
-        lv_label_set_text(context->trackArtistLabel, "");
-        lv_label_set_text(context->trackAlbumLabel, "");
+    const int32_t playbackIndex = context->currentTrackIndex.load();
+    bool hasTrack = false;
+    if (playbackIndex >= 0) {
+        std::lock_guard lock(context->tracksMutex);
+        if (static_cast<size_t>(playbackIndex) < context->playbackQueue.size()) {
+            track = context->playbackQueue[static_cast<size_t>(playbackIndex)];
+            hasTrack = true;
+        }
+    } else {
+        hasTrack = copyTrack(context, getSelectedTrackIndex(context), &track);
+    }
+    if (!hasTrack) {
+        if (context->trackTitleLabel != nullptr) {
+            lv_label_set_text(context->trackTitleLabel, "No track selected");
+            lv_label_set_text(context->trackArtistLabel, "");
+            lv_label_set_text(context->trackAlbumLabel, "");
+        }
+        if (context->miniTitleLabel != nullptr) {
+            lv_label_set_text(context->miniTitleLabel, "Nothing playing");
+            lv_label_set_text(context->miniArtistLabel, "");
+        }
         return;
     }
-    lv_label_set_text(context->trackTitleLabel, track.title.c_str());
-    lv_label_set_text(context->trackArtistLabel, track.artist.empty() ? "Unknown artist" : track.artist.c_str());
-    lv_label_set_text(context->trackAlbumLabel, track.album.empty() ? " " : track.album.c_str());
+    if (context->trackTitleLabel != nullptr) {
+        lv_label_set_text(context->trackTitleLabel, track.title.c_str());
+        lv_label_set_text(context->trackArtistLabel, track.artist.empty() ? "Unknown artist" : track.artist.c_str());
+        lv_label_set_text(context->trackAlbumLabel, track.album.empty() ? " " : track.album.c_str());
+    }
+    if (context->miniTitleLabel != nullptr) {
+        lv_label_set_text(context->miniTitleLabel, track.title.c_str());
+        lv_label_set_text(context->miniArtistLabel, track.artist.empty() ? " " : track.artist.c_str());
+    }
 }
 
-void onTrackClicked(lv_event_t* event) {
+void onFolderTimer(lv_timer_t* timer) {
+    auto* context = static_cast<MusicPlayerContext*>(lv_timer_get_user_data(timer));
+    context->folderTimer = nullptr;
+    musicPlayerScanFolder(context, context->pendingFolderPath);
+    renderTrackList(context);
+    updateTrackInfo(context);
+}
+
+void scheduleFolderScan(MusicPlayerContext* context, const std::string& path) {
+    context->pendingFolderPath = path;
+    if (context->folderTimer == nullptr) {
+        context->folderTimer = lv_timer_create(onFolderTimer, 0, context);
+        lv_timer_set_repeat_count(context->folderTimer, 1);
+    }
+}
+
+void onBrowserEntryClicked(lv_event_t* event) {
     auto* context = static_cast<MusicPlayerContext*>(lv_event_get_user_data(event));
     auto* row = lv_event_get_target_obj(event);
-    auto* path = static_cast<std::string*>(lv_obj_get_user_data(row));
-    if (path == nullptr) {
+    auto* selectedEntry = static_cast<MusicBrowserEntry*>(lv_obj_get_user_data(row));
+    if (selectedEntry == nullptr) {
         return;
     }
 
-    int32_t index = -1;
+    MusicBrowserEntry entry;
+    int32_t trackIndex = -1;
     {
         std::lock_guard lock(context->tracksMutex);
-        for (size_t i = 0; i < context->tracks.size(); i++) {
-            if (&context->tracks[i].path == path) {
-                index = static_cast<int32_t>(i);
-                context->selectedTrackIndex = index;
-                break;
+        const auto found = std::find_if(context->browserEntries.begin(), context->browserEntries.end(),
+                                        [selectedEntry](const MusicBrowserEntry& candidate) {
+                                            return &candidate == selectedEntry;
+                                        });
+        if (found == context->browserEntries.end()) {
+            return;
+        }
+        entry = *found;
+        if (!entry.isDirectory) {
+            for (size_t i = 0; i < context->tracks.size(); i++) {
+                if (context->tracks[i].path == entry.path) {
+                    trackIndex = static_cast<int32_t>(i);
+                    context->selectedTrackIndex = trackIndex;
+                    break;
+                }
             }
         }
     }
-    if (index >= 0) {
-        const uint32_t childCount = lv_obj_get_child_count(context->trackList);
-        for (uint32_t i = 0; i < childCount; i++) {
-            lv_obj_remove_state(lv_obj_get_child(context->trackList, static_cast<int32_t>(i)), LV_STATE_CHECKED);
-        }
-        lv_obj_add_state(row, LV_STATE_CHECKED);
+    if (entry.isDirectory) {
+        scheduleFolderScan(context, entry.path);
+    } else if (trackIndex >= 0) {
+        musicPlayerRequestStart(context, trackIndex);
         updateTrackInfo(context);
-        musicPlayerRequestStart(context, index);
     }
 }
 
 void renderTrackList(MusicPlayerContext* context) {
-    if (context->trackList == nullptr) {
+    if (context->browserList == nullptr) {
         return;
     }
-    lv_obj_clean(context->trackList);
+    lv_obj_clean(context->browserList);
 
     std::lock_guard lock(context->tracksMutex);
-    if (context->trackCountLabel != nullptr) {
-        lv_label_set_text_fmt(context->trackCountLabel, "%u", static_cast<unsigned>(context->tracks.size()));
+    if (context->browserPathLabel != nullptr) {
+        lv_label_set_text(context->browserPathLabel, context->folderPath.c_str());
     }
-    if (context->tracks.empty()) {
-        auto* emptyLabel = lv_label_create(context->trackList);
-        lv_label_set_text(emptyLabel, "No MP3 files in this folder");
+    if (context->browserEntries.empty()) {
+        auto* emptyLabel = lv_label_create(context->browserList);
+        lv_label_set_text(emptyLabel, "No folders or MP3 files");
         return;
     }
 
-    for (size_t i = 0; i < context->tracks.size(); i++) {
-        const MusicTrack& track = context->tracks[i];
-        auto* row = lv_button_create(context->trackList);
+    for (MusicBrowserEntry& entry : context->browserEntries) {
+        auto* row = lv_button_create(context->browserList);
         lv_obj_set_width(row, LV_PCT(100));
         lv_obj_set_height(row, LV_SIZE_CONTENT);
-        lv_obj_set_user_data(row, &context->tracks[i].path);
-        lv_obj_add_event_cb(row, onTrackClicked, LV_EVENT_CLICKED, context);
+        lv_obj_set_style_radius(row, 0, LV_STATE_DEFAULT);
+        lv_obj_set_style_border_width(row, 0, LV_STATE_DEFAULT);
+        lv_obj_set_user_data(row, &entry);
+        lv_obj_add_event_cb(row, onBrowserEntryClicked, LV_EVENT_CLICKED, context);
 
         auto* label = lv_label_create(row);
         lv_obj_set_width(label, LV_PCT(100));
         lv_label_set_long_mode(label, LV_LABEL_LONG_MODE_DOTS);
-        if (track.artist.empty()) {
-            lv_label_set_text(label, track.title.c_str());
-        } else {
-            lv_label_set_text_fmt(label, "%s - %s", track.title.c_str(), track.artist.c_str());
-        }
-        if (static_cast<int32_t>(i) == context->selectedTrackIndex) {
-            lv_obj_add_state(row, LV_STATE_CHECKED);
-        }
+        lv_label_set_text_fmt(label, "%s  %s", entry.isDirectory ? LV_SYMBOL_DIRECTORY : LV_SYMBOL_FILE,
+                              entry.name.c_str());
     }
 }
 
@@ -284,7 +346,6 @@ void selectAndPlay(MusicPlayerContext* context, int32_t index) {
         context->selectedTrackIndex = index;
     }
     updateTrackInfo(context);
-    renderTrackList(context);
     musicPlayerRequestStart(context, index);
 }
 
@@ -296,7 +357,12 @@ void onPlayPressed(lv_event_t* event) {
     } else if (state == MusicPlaybackState::Paused) {
         context->pauseRequested.store(false);
     } else {
-        musicPlayerRequestStart(context, getSelectedTrackIndex(context));
+        const int32_t currentTrack = context->currentTrackIndex.load();
+        if (currentTrack >= 0 && static_cast<size_t>(currentTrack) < getPlaybackQueueCount(context)) {
+            musicPlayerRequestQueueStart(context, currentTrack);
+        } else {
+            musicPlayerRequestStart(context, getSelectedTrackIndex(context));
+        }
     }
 }
 
@@ -306,6 +372,13 @@ void onStopPressed(lv_event_t* event) {
 
 void onPreviousPressed(lv_event_t* event) {
     auto* context = static_cast<MusicPlayerContext*>(lv_event_get_user_data(event));
+    const int32_t current = context->currentTrackIndex.load();
+    const size_t queueCount = getPlaybackQueueCount(context);
+    if (current >= 0 && queueCount > 0) {
+        musicPlayerRequestQueueStart(context, (current + static_cast<int32_t>(queueCount) - 1) %
+                                                 static_cast<int32_t>(queueCount));
+        return;
+    }
     const int32_t selected = getSelectedTrackIndex(context);
     if (selected >= 0) {
         selectAndPlay(context, selected - 1);
@@ -314,6 +387,12 @@ void onPreviousPressed(lv_event_t* event) {
 
 void onNextPressed(lv_event_t* event) {
     auto* context = static_cast<MusicPlayerContext*>(lv_event_get_user_data(event));
+    const int32_t current = context->currentTrackIndex.load();
+    const size_t queueCount = getPlaybackQueueCount(context);
+    if (current >= 0 && queueCount > 0) {
+        musicPlayerRequestQueueStart(context, (current + 1) % static_cast<int32_t>(queueCount));
+        return;
+    }
     const int32_t selected = getSelectedTrackIndex(context);
     if (selected >= 0) {
         selectAndPlay(context, selected + 1);
@@ -424,18 +503,67 @@ void createSettingsWidgets(lv_obj_t* parent, MusicPlayerContext* context, lv_coo
     setVolumeSliderFromDevice(context);
 }
 
-void createWidgetsImpl(lv_obj_t* parent, MusicPlayerContext* context) {
-    const lv_coord_t padding = lvgl_get_ui_density() == LVGL_UI_DENSITY_COMPACT ? 6 : 10;
+void onMiniPlayerClicked(lv_event_t* event) {
+    showView(static_cast<MusicPlayerContext*>(lv_event_get_user_data(event)), MusicPlayerView::Player);
+}
 
-    lv_obj_set_flex_flow(parent, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_scrollable(parent, false);
-    lv_obj_clean(parent);
+void createMiniPlayer(lv_obj_t* parent, MusicPlayerContext* context) {
+    auto* miniPlayer = lv_obj_create(parent);
+    lv_obj_set_width(miniPlayer, LV_PCT(100));
+    lv_obj_set_height(miniPlayer, LV_DPX(60));
+    lv_obj_set_flex_flow(miniPlayer, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(miniPlayer, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_all(miniPlayer, LV_DPX(6), LV_STATE_DEFAULT);
+    lv_obj_set_style_pad_gap(miniPlayer, LV_DPX(8), LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(miniPlayer, lv_color_make(25, 100, 190), LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_opa(miniPlayer, LV_OPA_COVER, LV_STATE_DEFAULT);
+    lv_obj_set_style_border_width(miniPlayer, 0, LV_STATE_DEFAULT);
+    lv_obj_add_flag(miniPlayer, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(miniPlayer, onMiniPlayerClicked, LV_EVENT_CLICKED, context);
 
-    if (context->view == MusicPlayerView::Settings) {
-        createSettingsWidgets(parent, context, padding);
-        return;
-    }
+    auto* artwork = lv_obj_create(miniPlayer);
+    lv_obj_set_size(artwork, LV_DPX(46), LV_DPX(46));
+    lv_obj_set_style_bg_color(artwork, lv_color_make(105, 50, 165), LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_opa(artwork, LV_OPA_COVER, LV_STATE_DEFAULT);
+    lv_obj_set_style_border_width(artwork, 0, LV_STATE_DEFAULT);
+    auto* artworkLabel = lv_label_create(artwork);
+    lv_label_set_text(artworkLabel, LV_SYMBOL_AUDIO);
+    lv_obj_set_style_text_color(artworkLabel, lv_color_white(), LV_STATE_DEFAULT);
+    lv_obj_center(artworkLabel);
 
+    auto* metadata = lv_obj_create(miniPlayer);
+    lv_obj_remove_style_all(metadata);
+    lv_obj_set_flex_grow(metadata, 1);
+    lv_obj_set_height(metadata, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(metadata, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_scrollable(metadata, false);
+    context->miniTitleLabel = lv_label_create(metadata);
+    lv_obj_set_width(context->miniTitleLabel, LV_PCT(100));
+    lv_label_set_long_mode(context->miniTitleLabel, LV_LABEL_LONG_MODE_DOTS);
+    lv_obj_set_style_text_color(context->miniTitleLabel, lv_color_white(), LV_STATE_DEFAULT);
+    context->miniArtistLabel = lv_label_create(metadata);
+    lv_obj_set_width(context->miniArtistLabel, LV_PCT(100));
+    lv_label_set_long_mode(context->miniArtistLabel, LV_LABEL_LONG_MODE_DOTS);
+    lv_obj_set_style_text_color(context->miniArtistLabel, lv_color_white(), LV_STATE_DEFAULT);
+
+    auto* playButton = lv_button_create(miniPlayer);
+    lv_obj_set_size(playButton, LV_DPX(38), LV_DPX(42));
+    context->miniPlayButtonLabel = lv_label_create(playButton);
+    lv_label_set_text(context->miniPlayButtonLabel, LV_SYMBOL_PLAY);
+    lv_obj_set_style_text_color(context->miniPlayButtonLabel, lv_color_white(), LV_STATE_DEFAULT);
+    lv_obj_center(context->miniPlayButtonLabel);
+    lv_obj_add_event_cb(playButton, onPlayPressed, LV_EVENT_CLICKED, context);
+
+    auto* nextButton = lv_button_create(miniPlayer);
+    lv_obj_set_size(nextButton, LV_DPX(38), LV_DPX(42));
+    auto* nextLabel = lv_label_create(nextButton);
+    lv_label_set_text(nextLabel, LV_SYMBOL_NEXT);
+    lv_obj_set_style_text_color(nextLabel, lv_color_white(), LV_STATE_DEFAULT);
+    lv_obj_center(nextLabel);
+    lv_obj_add_event_cb(nextButton, onNextPressed, LV_EVENT_CLICKED, context);
+}
+
+void createLibraryWidgets(lv_obj_t* parent, MusicPlayerContext* context, lv_coord_t padding) {
     auto* toolbar = lvgl_toolbar_create(parent, "Music Player");
     lvgl_toolbar_set_nav_action(toolbar, LV_SYMBOL_CLOSE, onClosePressed, context);
     lvgl_toolbar_add_text_button_action(toolbar, LV_SYMBOL_SETTINGS, onSettingsPressed, context);
@@ -450,15 +578,82 @@ void createWidgetsImpl(lv_obj_t* parent, MusicPlayerContext* context) {
     lv_obj_set_style_bg_opa(content, LV_OPA_TRANSP, LV_STATE_DEFAULT);
     lv_obj_set_scroll_dir(content, LV_DIR_VER);
 
+    auto* pathRow = createRow(content);
+    context->browserPathLabel = lv_label_create(pathRow);
+    lv_obj_set_flex_grow(context->browserPathLabel, 1);
+    lv_label_set_long_mode(context->browserPathLabel, LV_LABEL_LONG_MODE_DOTS);
+    lv_label_set_text(context->browserPathLabel, context->folderPath.c_str());
+    auto* parentButton = lv_button_create(pathRow);
+    setButtonText(parentButton, LV_SYMBOL_LEFT);
+    lv_obj_add_event_cb(parentButton, onParentFolderPressed, LV_EVENT_CLICKED, context);
+
+    context->browserList = lv_obj_create(content);
+    lv_obj_remove_style_all(context->browserList);
+    lv_obj_set_width(context->browserList, LV_PCT(100));
+    lv_obj_set_flex_grow(context->browserList, 1);
+    lv_obj_set_flex_flow(context->browserList, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_gap(context->browserList, LV_DPX(2), LV_STATE_DEFAULT);
+    lv_obj_set_scroll_dir(context->browserList, LV_DIR_VER);
+    renderTrackList(context);
+
+    createMiniPlayer(parent, context);
+}
+
+void createWidgetsImpl(lv_obj_t* parent, MusicPlayerContext* context) {
+    const lv_coord_t padding = lvgl_get_ui_density() == LVGL_UI_DENSITY_COMPACT ? 6 : 10;
+
+    lv_obj_set_flex_flow(parent, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_scrollable(parent, false);
+    lv_obj_clean(parent);
+
+    if (context->view == MusicPlayerView::Settings) {
+        createSettingsWidgets(parent, context, padding);
+        return;
+    }
+    if (context->view == MusicPlayerView::Library) {
+        createLibraryWidgets(parent, context, padding);
+        return;
+    }
+
+    auto* toolbar = lvgl_toolbar_create(parent, "Now Playing");
+    lvgl_toolbar_set_nav_action(toolbar, LV_SYMBOL_LEFT, onBackPressed, context);
+    lvgl_toolbar_add_text_button_action(toolbar, LV_SYMBOL_SETTINGS, onSettingsPressed, context);
+
+    auto* content = lv_obj_create(parent);
+    lv_obj_set_width(content, LV_PCT(100));
+    lv_obj_set_flex_grow(content, 1);
+    lv_obj_set_flex_flow(content, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_all(content, padding, LV_STATE_DEFAULT);
+    lv_obj_set_style_pad_gap(content, padding, LV_STATE_DEFAULT);
+    lv_obj_set_style_border_width(content, 0, LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_opa(content, LV_OPA_TRANSP, LV_STATE_DEFAULT);
+    lv_obj_set_scroll_dir(content, LV_DIR_VER);
+
     auto* playerCard = createCard(content);
+    lv_obj_set_flex_grow(playerCard, 1);
+    lv_obj_set_flex_align(playerCard, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    auto* artwork = lv_obj_create(playerCard);
+    lv_obj_set_size(artwork, LV_DPX(120), LV_DPX(120));
+    lv_obj_set_style_bg_color(artwork, lv_color_make(105, 50, 165), LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_opa(artwork, LV_OPA_COVER, LV_STATE_DEFAULT);
+    lv_obj_set_style_border_width(artwork, 0, LV_STATE_DEFAULT);
+    auto* artworkLabel = lv_label_create(artwork);
+    lv_label_set_text(artworkLabel, LV_SYMBOL_AUDIO);
+    lv_obj_set_style_text_color(artworkLabel, lv_color_white(), LV_STATE_DEFAULT);
+    lv_obj_set_style_text_font(artworkLabel, lvgl_get_text_font(FONT_SIZE_LARGE), LV_STATE_DEFAULT);
+    lv_obj_center(artworkLabel);
+
     context->trackTitleLabel = lv_label_create(playerCard);
     lv_obj_set_width(context->trackTitleLabel, LV_PCT(100));
     lv_obj_set_style_text_font(context->trackTitleLabel, lvgl_get_text_font(FONT_SIZE_LARGE), LV_STATE_DEFAULT);
+    lv_obj_set_style_text_align(context->trackTitleLabel, LV_TEXT_ALIGN_CENTER, LV_STATE_DEFAULT);
     lv_label_set_long_mode(context->trackTitleLabel, LV_LABEL_LONG_MODE_DOTS);
     context->trackArtistLabel = lv_label_create(playerCard);
     lv_obj_set_width(context->trackArtistLabel, LV_PCT(100));
+    lv_obj_set_style_text_align(context->trackArtistLabel, LV_TEXT_ALIGN_CENTER, LV_STATE_DEFAULT);
     context->trackAlbumLabel = lv_label_create(playerCard);
     lv_obj_set_width(context->trackAlbumLabel, LV_PCT(100));
+    lv_obj_set_style_text_align(context->trackAlbumLabel, LV_TEXT_ALIGN_CENTER, LV_STATE_DEFAULT);
 
     context->progressBar = lv_bar_create(playerCard);
     lv_obj_set_width(context->progressBar, LV_PCT(100));
@@ -486,23 +681,7 @@ void createWidgetsImpl(lv_obj_t* parent, MusicPlayerContext* context) {
     setButtonText(nextButton, LV_SYMBOL_NEXT);
     lv_obj_add_event_cb(nextButton, onNextPressed, LV_EVENT_CLICKED, context);
 
-    auto* listCard = createCard(content);
-    auto* listHeader = createRow(listCard);
-    auto* listTitle = lv_label_create(listHeader);
-    lv_label_set_text(listTitle, "Tracks");
-    context->trackCountLabel = lv_label_create(listHeader);
-    lv_obj_set_flex_grow(context->trackCountLabel, 1);
-    lv_obj_set_style_text_align(context->trackCountLabel, LV_TEXT_ALIGN_RIGHT, LV_STATE_DEFAULT);
-    context->trackList = lv_obj_create(listCard);
-    lv_obj_remove_style_all(context->trackList);
-    lv_obj_set_width(context->trackList, LV_PCT(100));
-    lv_obj_set_height(context->trackList, LV_SIZE_CONTENT);
-    lv_obj_set_flex_flow(context->trackList, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_style_pad_gap(context->trackList, LV_DPX(4), LV_STATE_DEFAULT);
-    lv_obj_set_scrollable(context->trackList, false);
-
     updateTrackInfo(context);
-    renderTrackList(context);
     setVolumeSliderFromDevice(context);
 }
 
@@ -513,23 +692,20 @@ void onRefreshTimer(lv_timer_t* timer) {
     }
 
     const MusicPlaybackState state = context->playbackState.load();
-    const int32_t currentTrack = context->currentTrackIndex.load();
-    if (state != MusicPlaybackState::Idle && currentTrack >= 0 && currentTrack != getSelectedTrackIndex(context)) {
-        {
-            std::lock_guard lock(context->tracksMutex);
-            if (static_cast<size_t>(currentTrack) < context->tracks.size()) {
-                context->selectedTrackIndex = currentTrack;
-            }
-        }
-        updateTrackInfo(context);
-        renderTrackList(context);
-    }
+    updateTrackInfo(context);
 
     if (context->playButtonLabel != nullptr) {
         if (state == MusicPlaybackState::Playing || state == MusicPlaybackState::Opening) {
             lv_label_set_text(context->playButtonLabel, LV_SYMBOL_PAUSE);
         } else {
             lv_label_set_text(context->playButtonLabel, LV_SYMBOL_PLAY);
+        }
+    }
+    if (context->miniPlayButtonLabel != nullptr) {
+        if (state == MusicPlaybackState::Playing || state == MusicPlaybackState::Opening) {
+            lv_label_set_text(context->miniPlayButtonLabel, LV_SYMBOL_PAUSE);
+        } else {
+            lv_label_set_text(context->miniPlayButtonLabel, LV_SYMBOL_PLAY);
         }
     }
 
@@ -582,6 +758,11 @@ void onRefreshTimer(lv_timer_t* timer) {
 
 void clearWidgetPointers(MusicPlayerContext* context) {
     context->folderInput = nullptr;
+    context->browserPathLabel = nullptr;
+    context->browserList = nullptr;
+    context->miniTitleLabel = nullptr;
+    context->miniArtistLabel = nullptr;
+    context->miniPlayButtonLabel = nullptr;
     context->outputDropdown = nullptr;
     context->volumeSlider = nullptr;
     context->volumeLabel = nullptr;
@@ -592,8 +773,6 @@ void clearWidgetPointers(MusicPlayerContext* context) {
     context->progressBar = nullptr;
     context->progressLabel = nullptr;
     context->playButtonLabel = nullptr;
-    context->trackList = nullptr;
-    context->trackCountLabel = nullptr;
 }
 
 } // namespace
@@ -604,6 +783,10 @@ void musicPlayerCreateWidgets(lv_obj_t* parent, void* userData) {
     if (context->refreshTimer != nullptr) {
         lv_timer_delete(context->refreshTimer);
         context->refreshTimer = nullptr;
+    }
+    if (context->folderTimer != nullptr) {
+        lv_timer_delete(context->folderTimer);
+        context->folderTimer = nullptr;
     }
     clearWidgetPointers(context);
     refreshOutputDevices(context);
@@ -621,6 +804,10 @@ void musicPlayerDestroyWidgets(void* userData) {
     if (context->viewTimer != nullptr) {
         lv_timer_delete(context->viewTimer);
         context->viewTimer = nullptr;
+    }
+    if (context->folderTimer != nullptr) {
+        lv_timer_delete(context->folderTimer);
+        context->folderTimer = nullptr;
     }
     clearWidgetPointers(context);
 }

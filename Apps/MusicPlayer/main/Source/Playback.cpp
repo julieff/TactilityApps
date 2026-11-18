@@ -25,10 +25,10 @@ void setStatus(MusicPlayerContext* context, const std::string& status) {
 
 bool getTrack(MusicPlayerContext* context, int32_t index, MusicTrack* output) {
     std::lock_guard lock(context->tracksMutex);
-    if (index < 0 || static_cast<size_t>(index) >= context->tracks.size()) {
+    if (index < 0 || static_cast<size_t>(index) >= context->playbackQueue.size()) {
         return false;
     }
-    *output = context->tracks[static_cast<size_t>(index)];
+    *output = context->playbackQueue[static_cast<size_t>(index)];
     return true;
 }
 
@@ -255,6 +255,17 @@ void musicPlayerRequestStart(MusicPlayerContext* context, int32_t trackIndex) {
         if (trackIndex < 0 || static_cast<size_t>(trackIndex) >= context->tracks.size()) {
             return;
         }
+        context->playbackQueue = context->tracks;
+    }
+    musicPlayerRequestQueueStart(context, trackIndex);
+}
+
+void musicPlayerRequestQueueStart(MusicPlayerContext* context, int32_t trackIndex) {
+    {
+        std::lock_guard lock(context->tracksMutex);
+        if (trackIndex < 0 || static_cast<size_t>(trackIndex) >= context->playbackQueue.size()) {
+            return;
+        }
     }
     {
         std::lock_guard lock(context->controlMutex);
@@ -311,12 +322,12 @@ void musicPlayerTaskEntry(void* param) {
             int32_t nextIndex = -1;
             {
                 std::lock_guard lock(context->tracksMutex);
-                if (static_cast<size_t>(requestedIndex + 1) < context->tracks.size()) {
+                if (static_cast<size_t>(requestedIndex + 1) < context->playbackQueue.size()) {
                     nextIndex = requestedIndex + 1;
                 }
             }
             if (nextIndex >= 0) {
-                musicPlayerRequestStart(context, nextIndex);
+                musicPlayerRequestQueueStart(context, nextIndex);
             } else {
                 setStatus(context, "Finished");
             }

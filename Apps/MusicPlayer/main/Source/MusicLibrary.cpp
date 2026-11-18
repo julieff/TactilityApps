@@ -254,7 +254,8 @@ void readTrackMetadata(MusicTrack& track) {
 }
 
 bool isValidSdFolder(const std::string& path) {
-    if (path.compare(0, 8, "/sdcard/") != 0 || path.find_first_of("\r\n\\") != std::string::npos) {
+    if ((path != "/sdcard" && path.compare(0, 8, "/sdcard/") != 0) ||
+        path.find_first_of("\r\n\\") != std::string::npos) {
         return false;
     }
 
@@ -280,6 +281,7 @@ void musicPlayerScanFolder(MusicPlayerContext* context, const std::string& path)
         {
             std::lock_guard lock(context->tracksMutex);
             context->tracks.clear();
+            context->browserEntries.clear();
             context->selectedTrackIndex = -1;
         }
         {
@@ -301,6 +303,7 @@ void musicPlayerScanFolder(MusicPlayerContext* context, const std::string& path)
         {
             std::lock_guard lock(context->tracksMutex);
             context->tracks.clear();
+            context->browserEntries.clear();
             context->selectedTrackIndex = -1;
         }
         {
@@ -312,35 +315,54 @@ void musicPlayerScanFolder(MusicPlayerContext* context, const std::string& path)
     }
 
     std::vector<MusicTrack> scanned;
+    std::vector<MusicBrowserEntry> entries;
     struct dirent* entry;
     while ((entry = readdir(directory)) != nullptr) {
-        if (!hasMp3Extension(entry->d_name)) {
+        if (entry->d_name[0] == '.') {
+            continue;
+        }
+
+        const std::string name(entry->d_name);
+        const std::string fullPath = path + "/" + name;
+        struct stat status {};
+        if (stat(fullPath.c_str(), &status) != 0) {
+            continue;
+        }
+        if (S_ISDIR(status.st_mode)) {
+            entries.push_back({name, fullPath, true});
+            continue;
+        }
+        if (!S_ISREG(status.st_mode) || !hasMp3Extension(entry->d_name)) {
             continue;
         }
 
         MusicTrack track;
-        track.path = path + "/" + entry->d_name;
-        struct stat status {};
-        if (stat(track.path.c_str(), &status) != 0 || !S_ISREG(status.st_mode)) {
-            continue;
-        }
+        track.path = fullPath;
         readTrackMetadata(track);
         scanned.push_back(std::move(track));
+        entries.push_back({name, fullPath, false});
     }
     closedir(directory);
 
     std::sort(scanned.begin(), scanned.end(), [](const MusicTrack& left, const MusicTrack& right) {
         return strcasecmp(left.title.c_str(), right.title.c_str()) < 0;
     });
+    std::sort(entries.begin(), entries.end(), [](const MusicBrowserEntry& left, const MusicBrowserEntry& right) {
+        if (left.isDirectory != right.isDirectory) {
+            return left.isDirectory;
+        }
+        return strcasecmp(left.name.c_str(), right.name.c_str()) < 0;
+    });
 
-    const size_t count = scanned.size();
+    const bool noTracks = scanned.empty();
     {
         std::lock_guard lock(context->tracksMutex);
         context->tracks = std::move(scanned);
-        context->selectedTrackIndex = context->tracks.empty() ? -1 : 0;
+        context->browserEntries = std::move(entries);
+        context->selectedTrackIndex = -1;
     }
     {
         std::lock_guard lock(context->statusMutex);
-        context->statusText = count == 0 ? "No MP3 files found" : "Ready";
+        context->statusText = noTracks ? "No MP3 files found" : "Ready";
     }
 }
